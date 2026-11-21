@@ -1467,19 +1467,17 @@ static int check_valid_request(struct qmi_uaudio_stream_req_msg_v01 *req_msg,
 	}
 
 	subs = find_substream(pcm_card_num, pcm_dev_num, direction);
-
-	if (!subs) {
-		uaudio_err("invalid substream\n");
-		return -EFAULT;
-	}
-
 	chip = uadev[pcm_card_num].chip;
-	if (!subs || !chip || atomic_read(&chip->shutdown)) {
+
+	if (!chip || atomic_read(&chip->shutdown)) {
 		uaudio_err("can't find substream for card# %u, dev# %u dir%u\n",
 				pcm_card_num, pcm_dev_num, direction);
 		return -ENODEV;
 	}
-
+	if (!subs) {
+		uaudio_err("invalid substream\n");
+		return -EFAULT;
+	}
 	*info_idx = info_idx_from_ifnum(pcm_card_num, subs->cur_audiofmt ?
 			subs->cur_audiofmt->iface : -1, req_msg->enable);
 
@@ -1540,16 +1538,8 @@ static void handle_uaudio_stream_req(struct qmi_handle *handle,
 	pcm_card_num = (req_msg->usb_token & SND_PCM_CARD_NUM_MASK) >> 16;
 
 	subs = find_substream(pcm_card_num, pcm_dev_num, direction);
-	if (!subs) {
-		uaudio_err("invalid substream\n");
-		goto response;
-	}
 
 	chip = uadev[pcm_card_num].chip;
-	if (!chip) {
-		uaudio_err("invalid chip\n");
-		goto response;
-	}
 
 	ret = check_valid_request(req_msg, &info_idx);
 	if (ret)

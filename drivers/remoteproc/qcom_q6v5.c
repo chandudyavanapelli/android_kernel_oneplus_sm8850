@@ -308,7 +308,7 @@ int qcom_q6v5_prepare(struct qcom_q6v5 *q6v5)
 	reinit_completion(&q6v5->start_done);
 	reinit_completion(&q6v5->stop_done);
 
-	q6v5->running = true;
+	atomic_set(&q6v5->running, 1);
 	q6v5->handover_issued = false;
 
 	enable_irq(q6v5->handover_irq);
@@ -606,8 +606,12 @@ static irqreturn_t q6v5_wdog_interrupt(int irq, void *data)
 	if (q6v5->early_boot && !completion_done(&q6v5->subsys_booted))
 		complete(&q6v5->subsys_booted);
 
-	/* Sometimes the stop triggers a watchdog rather than a stop-ack */
-	if (!q6v5->running) {
+	/*
+	 * Atomically clear running. If it was already false the DSP was either
+	 * being stopped normally (use wdog as stop-ack) or the fatal handler
+	 * already claimed this crash — either way, don't double-process.
+	 */
+	if (!atomic_xchg(&q6v5->running, 0)) {
 		complete(&q6v5->stop_done);
 		return IRQ_HANDLED;
 	}
@@ -624,8 +628,6 @@ static irqreturn_t q6v5_wdog_interrupt(int irq, void *data)
 		qcom_q6v5_conditional_recovery(q6v5, msg);
 	} else
 		dev_err(q6v5->dev, "watchdog without message\n");
-
-	q6v5->running = false;
 
 	if (q6v5->ssr_subdev)
 		qcom_notify_early_ssr_clients(q6v5->ssr_subdev);
@@ -729,7 +731,12 @@ static irqreturn_t q6v5_fatal_interrupt(int irq, void *data)
 	if (q6v5->early_boot && !completion_done(&q6v5->subsys_booted))
 		complete(&q6v5->subsys_booted);
 
-	if (!q6v5->running)
+	/*
+	 * Atomically claim the crash. If running was already false, the wdog
+	 * handler already claimed it (or the DSP is being stopped) — drop the
+	 * duplicate fatal to avoid triggering a second recovery cycle.
+	 */
+	if (!atomic_xchg(&q6v5->running, 0))
 		return IRQ_HANDLED;
 
 	dev_err(q6v5->dev, "rproc crash at cycle:%llu, recovery state: %s\n",
@@ -752,14 +759,9 @@ static irqreturn_t q6v5_fatal_interrupt(int irq, void *data)
 	}
 
 #ifdef CONFIG_QCOM_CRASH_SYMBOL_MATCH
-	if (queue_work(system_freezable_wq, &q6v5->symbol_loader)) {
-		dev_info(q6v5->dev, "Symbol loader work started\n");
-		flush_work(&q6v5->symbol_loader);
-	} else {
-		dev_err(q6v5->dev, "Failed to queue symbol loader work\n");
-	}
+	if (q6v5->crash_stack)
+		queue_work(system_freezable_wq, &q6v5->symbol_loader);
 #endif
-	q6v5->running = false;
 
 	if (q6v5->ssr_subdev)
 		qcom_notify_early_ssr_clients(q6v5->ssr_subdev);
@@ -923,7 +925,7 @@ int qcom_q6v5_request_stop(struct qcom_q6v5 *q6v5, struct qcom_sysmon *sysmon)
 {
 	int ret;
 
-	q6v5->running = false;
+	atomic_set(&q6v5->running, 0);
 
 	/* Don't perform SMP2P dance if remote isn't running */
 	if (qcom_sysmon_shutdown_acked(sysmon) || (q6v5->rproc->state != RPROC_RUNNING))
@@ -1212,6 +1214,9 @@ EXPORT_SYMBOL_GPL(qcom_q6v5_init);
  */
 void qcom_q6v5_deinit(struct qcom_q6v5 *q6v5)
 {
+#ifdef CONFIG_QCOM_CRASH_SYMBOL_MATCH
+	cancel_work_sync(&q6v5->symbol_loader);
+#endif
 	wakeup_source_unregister(q6v5->ws);
 	qmp_put(q6v5->qmp);
 }
